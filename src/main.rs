@@ -195,18 +195,14 @@ impl ClipperApp {
             ));
             return;
         }
+        self.spawn_play(meta.path, meta.width, meta.height, meta.fps, from, to);
+    }
 
-        let frame_rx = match ffmpeg::play_stream(
-            meta.path.clone(),
-            from,
-            to,
-            meta.width,
-            meta.height,
-            meta.fps,
-        ) {
+    fn spawn_play(&mut self, path: PathBuf, width: u32, height: u32, fps: f64, from: f64, to: f64) {
+        let frame_rx = match ffmpeg::play_stream(path.clone(), from, to, width, height, fps) {
             Ok(rx) => {
                 eprintln!("[clipper] play_stream spawned for {} ({}x{}, {:.2}s → {:.2}s)",
-                    meta.path.display(), meta.width, meta.height, from, to);
+                    path.display(), width, height, from, to);
                 rx
             }
             Err(e) => {
@@ -421,15 +417,22 @@ impl ClipperApp {
             egui::Color32::from_gray(180),
         );
 
-        // Click-to-seek on bar background
+        // Click-to-seek-and-play on bar background: clicking anywhere in
+        // [IN, OUT] starts playback from the clicked time and plays to OUT.
+        // Clicks outside that range fall back to seeking only (no play).
         if bar_resp.clicked() || bar_resp.dragged() {
             if let Some(pos) = bar_resp.interact_pointer_pos() {
                 let frac = ((pos.x - bar_rect.left()) / bar_rect.width()).clamp(0.0, 1.0) as f64;
                 let raw_t = frac * dur;
                 let snapped_t = if fps > 0.0 { (raw_t * fps).round() / fps } else { raw_t };
-                self.playhead = snapped_t;
-                self.playing = false;
-                self.request_frame(snapped_t);
+                let clamped_t = snapped_t.clamp(self.in_marker, self.out_marker);
+                self.playhead = clamped_t;
+                self.request_frame(clamped_t);
+
+                // Auto-play: from click (clamped to [IN, OUT]) to OUT.
+                if self.out_marker > self.in_marker && clamped_t < self.out_marker {
+                    self.spawn_play(meta.path, meta.width, meta.height, fps, clamped_t, self.out_marker);
+                }
             }
         }
 
