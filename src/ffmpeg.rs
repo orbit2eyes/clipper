@@ -238,7 +238,7 @@ pub fn play_stream(
     source_width: u32,
     source_height: u32,
     source_fps: f64,
-) -> Result<std::sync::mpsc::Receiver<(image::DynamicImage, Option<String>)>> {
+) -> Result<std::sync::mpsc::Receiver<(image::DynamicImage, Option<String>, f64)>> {
     let ffmpeg = find_ffmpeg();
     let (pw, ph) = preview_size(source_width, source_height);
     let mut cmd = Command::new(&ffmpeg);
@@ -265,7 +265,7 @@ pub fn play_stream(
         ffmpeg.display(), in_seconds, out_seconds, path.display(), pw, ph, source_fps
     );
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(image::DynamicImage, Option<String>)>(4);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(image::DynamicImage, Option<String>, f64)>(4);
 
     std::thread::spawn(move || {
         // Drain stderr in a separate thread, capturing only the first line.
@@ -288,11 +288,8 @@ pub fn play_stream(
 
         // Real-time pacing: target wall-clock time for frame `i` is
         // `start + i / fps`. If we're ahead, sleep; if behind, send immediately.
-        let frame_period = if source_fps > 0.0 {
-            Duration::from_secs_f64(1.0 / source_fps)
-        } else {
-            Duration::from_millis(33)
-        };
+        let frame_period_secs = if source_fps > 0.0 { 1.0 / source_fps } else { 1.0 / 30.0 };
+        let frame_period = Duration::from_secs_f64(frame_period_secs);
         let start = Instant::now();
         let mut i: u64 = 0;
 
@@ -300,8 +297,10 @@ pub fn play_stream(
             match stdout.read_exact(&mut buf) {
                 Ok(()) => {
                     if let Some(img) = image::RgbaImage::from_raw(pw, ph, buf.clone()) {
+                        // Frame i corresponds to source time `in_seconds + i * frame_period_secs`.
+                        let frame_time = in_seconds + (i as f64) * frame_period_secs;
                         let msg = erx.try_recv().ok();
-                        if tx.send((image::DynamicImage::ImageRgba8(img), msg)).is_err() {
+                        if tx.send((image::DynamicImage::ImageRgba8(img), msg, frame_time)).is_err() {
                             break;
                         }
                         let target = start + frame_period.checked_mul(i as u32).unwrap_or(start.elapsed());

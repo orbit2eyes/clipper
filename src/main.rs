@@ -216,15 +216,15 @@ impl ClipperApp {
             }
         };
 
-        // Bridge the (image, ffmpeg_stderr) stream into our FrameMsg stream.
+        // Bridge the (image, ffmpeg_stderr, frame_time) stream into our FrameMsg stream.
         let (tx, rx) = channel::<FrameMsg>();
         std::thread::spawn(move || {
-            while let Ok((img, ffmpeg_msg)) = frame_rx.recv() {
+            while let Ok((img, ffmpeg_msg, frame_time)) = frame_rx.recv() {
                 let msg = match ffmpeg_msg {
                     Some(m) => Some(format!("ffmpeg: {}", m)),
                     None => None,
                 };
-                if tx.send(FrameMsg::Image(img, 0.0, msg)).is_err() { break; }
+                if tx.send(FrameMsg::Image(img, frame_time, msg)).is_err() { break; }
             }
             let _ = tx.send(FrameMsg::Done);
         });
@@ -336,6 +336,139 @@ impl ClipperApp {
         self.export.in_progress = false;
         self.export.progress = 0.0;
     }
+
+    fn timeline_strip(&mut self, ui: &mut egui::Ui, avail: egui::Vec2) {
+        let Some(meta) = self.source.clone() else { return };
+        let dur = meta.duration_secs;
+        if dur <= 0.0 { return; }
+        let fps = meta.fps;
+
+        let strip_h = avail.y.min(40.0);
+        let (bar_rect, bar_resp) = ui.allocate_exact_size(
+            egui::vec2(avail.x, strip_h),
+            egui::Sense::click_and_drag(),
+        );
+
+        let to_x = |t: f64| -> f32 {
+            let frac = (t / dur).clamp(0.0, 1.0) as f32;
+            bar_rect.left() + frac * bar_rect.width()
+        };
+
+        // Background
+        ui.painter().rect_filled(bar_rect, 2.0, egui::Color32::from_gray(35));
+
+        // Cut region band
+        let in_x = to_x(self.in_marker);
+        let out_x = to_x(self.out_marker);
+        if in_x < out_x {
+            let band = egui::Rect::from_min_max(
+                egui::pos2(in_x, bar_rect.top()),
+                egui::pos2(out_x, bar_rect.bottom()),
+            );
+            ui.painter().rect_filled(band, 0.0, egui::Color32::from_rgb(60, 100, 160));
+        }
+
+        // Playhead line
+        let play_x = to_x(self.playhead);
+        ui.painter().line_segment(
+            [egui::pos2(play_x, bar_rect.top()), egui::pos2(play_x, bar_rect.bottom())],
+            egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
+        );
+
+        // IN / OUT triangles
+        let tri_size = 6.0_f32;
+        let in_pos = egui::pos2(in_x, bar_rect.top());
+        let out_pos = egui::pos2(out_x, bar_rect.top());
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![
+                in_pos + egui::vec2(-tri_size, 0.0),
+                in_pos + egui::vec2(tri_size, 0.0),
+                in_pos + egui::vec2(0.0, tri_size * 1.5),
+            ],
+            egui::Color32::YELLOW,
+            egui::Stroke::NONE,
+        ));
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![
+                out_pos + egui::vec2(-tri_size, 0.0),
+                out_pos + egui::vec2(tri_size, 0.0),
+                out_pos + egui::vec2(0.0, tri_size * 1.5),
+            ],
+            egui::Color32::YELLOW,
+            egui::Stroke::NONE,
+        ));
+
+        // Edge time labels (HH:MM:SS)
+        let label_fmt = |t: f64| -> String {
+            let total = t as u64;
+            let h = total / 3600;
+            let m = (total % 3600) / 60;
+            let s = total % 60;
+            format!("{:01}:{:02}:{:02}", h, m, s)
+        };
+        ui.painter().text(
+            bar_rect.left_bottom() + egui::vec2(4.0, -2.0),
+            egui::Align2::LEFT_BOTTOM,
+            label_fmt(0.0),
+            egui::FontId::monospace(10.0),
+            egui::Color32::from_gray(180),
+        );
+        ui.painter().text(
+            bar_rect.right_bottom() + egui::vec2(-4.0, -2.0),
+            egui::Align2::RIGHT_BOTTOM,
+            label_fmt(dur),
+            egui::FontId::monospace(10.0),
+            egui::Color32::from_gray(180),
+        );
+
+        // Click-to-seek on bar background
+        if bar_resp.clicked() || bar_resp.dragged() {
+            if let Some(pos) = bar_resp.interact_pointer_pos() {
+                let frac = ((pos.x - bar_rect.left()) / bar_rect.width()).clamp(0.0, 1.0) as f64;
+                let raw_t = frac * dur;
+                let snapped_t = if fps > 0.0 { (raw_t * fps).round() / fps } else { raw_t };
+                self.playhead = snapped_t;
+                self.playing = false;
+                self.request_frame(snapped_t);
+            }
+        }
+
+        // IN triangle drag
+        let in_tri_rect = egui::Rect::from_center_size(
+            in_pos,
+            egui::vec2(tri_size * 2.5, tri_size * 2.5),
+        );
+        let in_tri_resp = ui.allocate_rect(in_tri_rect, egui::Sense::drag());
+        if in_tri_resp.dragged() {
+            let delta_x = in_tri_resp.drag_delta().x;
+            let delta_t = (delta_x / bar_rect.width() as f32) as f64 * dur;
+            let raw = self.in_marker + delta_t;
+            let snapped = if fps > 0.0 { (raw * fps).round() / fps } else { raw };
+            let new_in = snapped.clamp(0.0, self.out_marker);
+            if (new_in - self.in_marker).abs() > 1e-6 {
+                self.in_marker = new_in;
+                self.playing = false;
+            }
+        }
+
+        // OUT triangle drag
+        let out_tri_rect = egui::Rect::from_center_size(
+            out_pos,
+            egui::vec2(tri_size * 2.5, tri_size * 2.5),
+        );
+        let out_tri_resp = ui.allocate_rect(out_tri_rect, egui::Sense::drag());
+        if out_tri_resp.dragged() {
+            let delta_x = out_tri_resp.drag_delta().x;
+            let delta_t = (delta_x / bar_rect.width() as f32) as f64 * dur;
+            let raw = self.out_marker + delta_t;
+            let snapped = if fps > 0.0 { (raw * fps).round() / fps } else { raw };
+            let new_out = snapped.clamp(self.in_marker, dur);
+            if (new_out - self.out_marker).abs() > 1e-6 {
+                self.out_marker = new_out;
+                self.playing = false;
+            }
+        }
+    }
 }
 
 impl eframe::App for ClipperApp {
@@ -387,7 +520,8 @@ impl eframe::App for ClipperApp {
                 self.poll_frame(ctx);
                 self.poll_export();
 
-                let avail = ui.available_size();
+                let full_avail = ui.available_size();
+                let avail = egui::vec2(full_avail.x, (full_avail.y - 44.0).max(100.0));
                 let resp = ui.allocate_response(avail, egui::Sense::click_and_drag());
 
                 if let (Some(tex), Some(meta_clone)) = (&self.preview.texture, self.source.clone()) {
@@ -464,6 +598,8 @@ impl eframe::App for ClipperApp {
                 } else {
                     ui.centered_and_justified(|ui| ui.label("Loading preview…"));
                 }
+                // Timeline strip below the preview
+                self.timeline_strip(ui, egui::vec2(full_avail.x, 40.0));
             } else {
                 ui.heading("clipper");
                 ui.label("Open a video file or drop one onto the window.");
