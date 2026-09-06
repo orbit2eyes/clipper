@@ -33,10 +33,19 @@ struct ClipperApp {
     out_marker: f64,
     preview: PreviewState,
     playing: bool,
-    crop: Option<CropRect>,
+    current_crop: CropRect,
+    selected_clip: Option<usize>,
     export: ExportState,
     output_dir: Option<PathBuf>,
     last_export: Option<PathBuf>,
+    clips: Vec<QueuedClip>,
+    export_queue: Option<std::collections::VecDeque<QueuedClip>>,
+    export_index: usize,
+    last_export_count: usize,
+    drag_start_x: Option<f32>,
+    drag_target_clip: Option<usize>,
+    drag_start_clip_in: f64,
+    drag_total: f32,
 }
 
 #[derive(Default)]
@@ -60,7 +69,7 @@ struct PreviewState {
     last_loaded: f64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct CropRect {
     x: i32,
     y: i32,
@@ -92,6 +101,13 @@ impl CropRect {
 
 }
 
+#[derive(Clone, Debug)]
+struct QueuedClip {
+    in_t: f64,
+    out_t: f64,
+    crop: CropRect,
+}
+
 impl ClipperApp {
     fn load_path(&mut self, path: PathBuf) {
         self.error = None;
@@ -102,7 +118,8 @@ impl ClipperApp {
             Ok(meta) => {
                 self.in_marker = 0.0;
                 self.out_marker = meta.duration_secs;
-                self.crop = Some(CropRect::default_for(meta.width, meta.height));
+                self.current_crop = CropRect::default_for(meta.width, meta.height);
+                self.selected_clip = None;
                 self.source = Some(meta);
             }
             Err(e) => self.error = Some(format!("Could not load {}: {}", path.display(), e)),
@@ -229,28 +246,22 @@ impl ClipperApp {
         self.preview.pending = Some(rx);
     }
 
-    fn start_export(&mut self) {
-        if self.export.in_progress { return; }
-        let (Some(meta), Some(crop)) = (self.source.clone(), self.crop) else { return };
-        if self.out_marker <= self.in_marker {
-            self.error = Some("OUT must be greater than IN".to_string());
+    /// Spawn the ffmpeg child for a single clip export. Reads source/crop from
+    /// `self` at call time, computes the next output filename, drives progress.
+    /// Caller is responsible for setting `self.export.in_progress` and queue state.
+    fn spawn_one_export(&mut self, source: PathBuf, has_audio: bool, crop: CropRect, in_t: f64, out_t: f64) {
+        let Some(dir) = self.output_dir.clone() else {
+            self.error = Some("Output directory not set".to_string());
             return;
-        }
-        let dir = match &self.output_dir {
-            Some(d) => d.clone(),
-            None => match rfd::FileDialog::new().pick_folder() {
-                Some(d) => { self.output_dir = Some(d.clone()); d }
-                None => return,
-            },
         };
         let output = ffmpeg::next_short_name(&dir);
         let req = ffmpeg::ExportRequest {
-            source: meta.path.clone(),
-            in_seconds: self.in_marker,
-            out_seconds: self.out_marker,
+            source: source.clone(),
+            in_seconds: in_t,
+            out_seconds: out_t,
             crop: (crop.x, crop.y, crop.w, crop.h),
             output: output.clone(),
-            has_audio: meta.audio_codec.is_some(),
+            has_audio,
         };
 
         let mut child = ffmpeg::spawn_export(req);
@@ -262,7 +273,7 @@ impl ClipperApp {
         self.export.error = None;
         self.export.child = Some(child);
 
-        let duration = (self.out_marker - self.in_marker).max(0.001);
+        let duration = (out_t - in_t).max(0.001);
         std::thread::spawn(move || {
             use std::io::{BufRead, BufReader};
             let reader = BufReader::new(stdout);
@@ -302,6 +313,12 @@ impl ClipperApp {
                         }
                         Err(e) => self.error = Some(e),
                     }
+                    // If a batch is in progress, kick off the next clip.
+                    // spawn_next_in_queue handles the empty-queue case (sets the
+                    // "Saved N clips" message itself), so we just call and return.
+                    if self.export_queue.is_some() {
+                        self.spawn_next_in_queue();
+                    }
                     return;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -329,15 +346,75 @@ impl ClipperApp {
             // drain
             while rx.try_recv().is_ok() {}
         }
+        // Drop any remaining batch queue (user's persisted queue stays intact).
+        self.export_queue = None;
+        self.export_index = 0;
         self.export.in_progress = false;
         self.export.progress = 0.0;
+    }
+
+    fn remove_clip(&mut self, idx: usize) {
+        if idx < self.clips.len() {
+            self.clips.remove(idx);
+        }
+    }
+
+    fn start_batch(&mut self) {
+        if self.clips.is_empty() || self.export_queue.is_some() {
+            return;
+        }
+        if self.source.is_none() {
+            self.error = Some("Open a video first".to_string());
+            return;
+        }
+        // Validate every clip's IN<OUT before we start.
+        for c in &self.clips {
+            if c.in_t >= c.out_t {
+                self.error = Some("Cannot start batch: every clip must have IN < OUT".to_string());
+                return;
+            }
+        }
+        // Pick output dir if not set (once for the whole batch).
+        if self.output_dir.is_none() {
+            if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                self.output_dir = Some(d);
+            } else {
+                return;
+            }
+        }
+        let queue: std::collections::VecDeque<QueuedClip> = self.clips.iter().cloned().collect();
+        let total = queue.len();
+        self.export_queue = Some(queue);
+        self.export_index = 1;
+        self.last_export_count = total;
+        self.spawn_next_in_queue();
+    }
+
+    fn spawn_next_in_queue(&mut self) {
+        let Some(queue) = self.export_queue.as_mut() else { return };
+        let Some(clip) = queue.pop_front() else {
+            let n = self.last_export_count;
+            self.export_queue = None;
+            self.export_index = 0;
+            self.error = Some(format!("Saved {} clips", n));
+            return;
+        };
+        let Some(meta) = self.source.clone() else {
+            self.export_queue = None;
+            self.export_index = 0;
+            self.error = Some("Source no longer available".to_string());
+            return;
+        };
+        if !self.export.in_progress {
+            self.spawn_one_export(meta.path, meta.audio_codec.is_some(), clip.crop, clip.in_t, clip.out_t);
+            self.export_index += 1;
+        }
     }
 
     fn timeline_strip(&mut self, ui: &mut egui::Ui, avail: egui::Vec2) {
         let Some(meta) = self.source.clone() else { return };
         let dur = meta.duration_secs;
         if dur <= 0.0 { return; }
-        let fps = meta.fps;
 
         let strip_h = avail.y.min(40.0);
         let (bar_rect, bar_resp) = ui.allocate_exact_size(
@@ -349,54 +426,255 @@ impl ClipperApp {
             let frac = (t / dur).clamp(0.0, 1.0) as f32;
             bar_rect.left() + frac * bar_rect.width()
         };
+        let x_to_t = |x: f32| -> f64 {
+            let frac = ((x - bar_rect.left()) / bar_rect.width()).clamp(0.0, 1.0) as f64;
+            frac * dur
+        };
 
         // Background
         ui.painter().rect_filled(bar_rect, 2.0, egui::Color32::from_gray(35));
 
-        // Cut region band
-        let in_x = to_x(self.in_marker);
-        let out_x = to_x(self.out_marker);
-        if in_x < out_x {
-            let band = egui::Rect::from_min_max(
-                egui::pos2(in_x, bar_rect.top()),
-                egui::pos2(out_x, bar_rect.bottom()),
-            );
-            ui.painter().rect_filled(band, 0.0, egui::Color32::from_rgb(60, 100, 160));
+        // Drag-to-define a new clip: drag_start_x tracks where the drag began;
+        // on drag_stopped, the range becomes a new queued clip.
+        if bar_resp.drag_started() {
+            if let Some(pos) = bar_resp.interact_pointer_pos() {
+                self.drag_start_x = Some(pos.x);
+            }
+        }
+        if let Some(start_x) = self.drag_start_x {
+            if let Some(cur_pos) = bar_resp.interact_pointer_pos() {
+                let cur_x = cur_pos.x;
+                let lo = start_x.min(cur_x);
+                let hi = start_x.max(cur_x);
+                let drag_rect = egui::Rect::from_min_max(
+                    egui::pos2(lo, bar_rect.top()),
+                    egui::pos2(hi, bar_rect.bottom()),
+                );
+                ui.painter().rect_filled(
+                    drag_rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(120, 200, 130, 110),
+                );
+                ui.painter().rect_stroke(
+                    drag_rect,
+                    0.0,
+                    egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(120, 200, 130)),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if bar_resp.drag_stopped() {
+                if let Some(cur_pos) = bar_resp.interact_pointer_pos() {
+                    let in_t = x_to_t(self.drag_start_x.unwrap_or(cur_pos.x).min(cur_pos.x));
+                    let out_t = x_to_t(self.drag_start_x.unwrap_or(cur_pos.x).max(cur_pos.x));
+                    if out_t - in_t >= 0.05 {
+                        self.clips.push(QueuedClip {
+                            in_t,
+                            out_t,
+                            crop: self.current_crop,
+                        });
+                    }
+                }
+                self.drag_start_x = None;
+            }
         }
 
-        // Playhead line
+        // Single-click = seek (only if not currently dragging).
+        if bar_resp.clicked() && self.drag_start_x.is_none() {
+            if let Some(pos) = bar_resp.interact_pointer_pos() {
+                let t = x_to_t(pos.x);
+                self.playhead = t;
+                self.request_frame(t);
+            }
+        }
+
+        // Queued clips — outlined bands with a number label. Each clip is
+        // interactive in three ways:
+        //   - drag the body  → move the clip (width preserved)
+        //   - click the body → remove the clip
+        //   - drag the left edge  → resize IN (changes duration)
+        //   - drag the right edge → resize OUT (changes duration)
+        // Edges have higher hit-test priority than the body, so they're
+        // allocated after the body rect.
+        let queued_color = egui::Color32::from_rgb(120, 200, 130);
+        let selected_color = egui::Color32::from_rgb(255, 220, 80);
+        let to_remove: Option<usize> = None;
+        let n = self.clips.len();
+        for i in 0..n {
+            // Copy out the values we need so we can mutate self.clips[i] later.
+            let clip_in_t = self.clips[i].in_t;
+            let clip_out_t = self.clips[i].out_t;
+            let clip_crop = self.clips[i].crop;
+            let is_selected = self.selected_clip == Some(i);
+            let clip_color = if is_selected { selected_color } else { queued_color };
+            let clip_outline = egui::Stroke::new(if is_selected { 3.0_f32 } else { 2.0_f32 }, clip_color);
+            let ci = to_x(clip_in_t);
+            let co = to_x(clip_out_t);
+            if ci < co {
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(ci, bar_rect.top()),
+                    egui::pos2(co, bar_rect.bottom()),
+                );
+                let edge_w = 8.0_f32;
+
+                // Body rect (middle of clip) — drag to move; click to select
+                let body_rect = egui::Rect::from_min_max(
+                    egui::pos2(rect.min.x + edge_w, rect.min.y),
+                    egui::pos2(rect.max.x - edge_w, rect.max.y),
+                );
+                // Body uses Sense::click_and_drag, but we explicitly add a
+                // separate Sense::click overlay for selection so click always
+                // registers regardless of egui's drag classification.
+                let body_resp = ui.allocate_rect(body_rect, egui::Sense::drag());
+                let body_click_resp = ui.allocate_rect(body_rect, egui::Sense::click());
+
+                // Left edge — resize IN
+                let left_edge = egui::Rect::from_min_max(
+                    egui::pos2(rect.min.x, rect.min.y),
+                    egui::pos2(rect.min.x + edge_w, rect.max.y),
+                );
+                let left_resp = ui.allocate_rect(left_edge, egui::Sense::drag());
+                if left_resp.dragged() {
+                    let dx = left_resp.drag_delta().x;
+                    let dt = (dx / bar_rect.width() as f32) as f64 * dur;
+                    let new_in = (clip_in_t + dt).clamp(0.0, clip_out_t - 0.05);
+                    self.clips[i].in_t = new_in;
+                }
+
+                // Right edge — resize OUT (highest priority within clip)
+                let right_edge = egui::Rect::from_min_max(
+                    egui::pos2(rect.max.x - edge_w, rect.min.y),
+                    egui::pos2(rect.max.x, rect.max.y),
+                );
+                let right_resp = ui.allocate_rect(right_edge, egui::Sense::drag());
+                if right_resp.dragged() {
+                    let dx = right_resp.drag_delta().x;
+                    let dt = (dx / bar_rect.width() as f32) as f64 * dur;
+                    let new_out = (clip_out_t + dt).clamp(clip_in_t + 0.05, dur);
+                    self.clips[i].out_t = new_out;
+                }
+
+                // Draw outline + number on top of all rects
+                ui.painter().rect_stroke(
+                    rect,
+                    0.0,
+                    clip_outline,
+                    egui::StrokeKind::Inside,
+                );
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{}", i + 1),
+                    egui::FontId::monospace(11.0),
+                    clip_color,
+                );
+
+                if body_resp.hovered() {
+                    ui.painter().text(
+                        egui::pos2(rect.center().x, bar_rect.top() - 4.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        format!("Clip {}  (right-click to delete)", i + 1),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::from_gray(180),
+                    );
+                }
+
+                if body_resp.drag_started() {
+                    // Anchor the drag to the clip's current IN so the move
+                    // is computed from drag-start position every frame.
+                    self.drag_total = 0.0;
+                    self.drag_target_clip = Some(i);
+                    self.drag_start_clip_in = clip_in_t;
+                    if let Some(pos) = body_resp.interact_pointer_pos() {
+                        self.drag_start_x = Some(pos.x);
+                    }
+                }
+
+                if body_resp.dragged() && self.drag_target_clip == Some(i) {
+                    self.drag_total += body_resp.drag_delta().length();
+                    if self.drag_total > 4.0 {
+                        // Real drag — move the clip; width preserved.
+                        if let (Some(start_x), Some(cur_pos)) =
+                            (self.drag_start_x, body_resp.interact_pointer_pos())
+                        {
+                            let dx = cur_pos.x - start_x;
+                            let dt = (dx / bar_rect.width() as f32) as f64 * dur;
+                            let width = clip_out_t - clip_in_t;
+                            let new_in = (self.drag_start_clip_in + dt).clamp(0.0, dur - width);
+                            let new_out = new_in + width;
+                            self.clips[i].in_t = new_in;
+                            self.clips[i].out_t = new_out;
+                        }
+                    }
+                }
+                if body_resp.drag_stopped() && self.drag_target_clip == Some(i) {
+                    if self.drag_total <= 4.0 {
+                        // Tiny drag / click-with-jitter — treat as click → select.
+                        self.selected_clip = Some(i);
+                        self.current_crop = clip_crop;
+                    }
+                    self.drag_target_clip = None;
+                    self.drag_start_x = None;
+                }
+
+                if body_resp.secondary_clicked() {
+                    // Right-click — delete this clip (Premiere-style).
+                    self.remove_clip(i);
+                    if self.selected_clip == Some(i) {
+                        self.selected_clip = None;
+                    } else if let Some(sel) = self.selected_clip {
+                        if sel > i {
+                            self.selected_clip = Some(sel - 1);
+                        }
+                    }
+                } else if body_click_resp.clicked() {
+                    // Pure click — select this clip; preview crop jumps to its crop.
+                    self.selected_clip = Some(i);
+                    self.current_crop = clip_crop;
+                }
+            }
+        }
+        if let Some(i) = to_remove {
+            self.remove_clip(i);
+            // Clear selection if we just removed the selected clip
+            if self.selected_clip == Some(i) {
+                self.selected_clip = None;
+            } else if let Some(sel) = self.selected_clip {
+                if sel > i {
+                    self.selected_clip = Some(sel - 1);
+                }
+            }
+        }
+
+        // Playhead line — drawn early so queued bands render on top of it.
         let play_x = to_x(self.playhead);
         ui.painter().line_segment(
             [egui::pos2(play_x, bar_rect.top()), egui::pos2(play_x, bar_rect.bottom())],
             egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
         );
 
-        // IN / OUT triangles
-        let tri_size = 6.0_f32;
-        let in_pos = egui::pos2(in_x, bar_rect.top());
-        let out_pos = egui::pos2(out_x, bar_rect.top());
-        ui.painter().add(egui::Shape::convex_polygon(
-            vec![
-                in_pos + egui::vec2(-tri_size, 0.0),
-                in_pos + egui::vec2(tri_size, 0.0),
-                in_pos + egui::vec2(0.0, tri_size * 1.5),
-            ],
-            egui::Color32::YELLOW,
-            egui::Stroke::NONE,
-        ));
-        ui.painter().add(egui::Shape::convex_polygon(
-            vec![
-                out_pos + egui::vec2(-tri_size, 0.0),
-                out_pos + egui::vec2(tri_size, 0.0),
-                out_pos + egui::vec2(0.0, tri_size * 1.5),
-            ],
-            egui::Color32::YELLOW,
-            egui::Stroke::NONE,
-        ));
+        // Playhead hit rect — allocated BEFORE clips so clips win on overlap.
+        // Drag here to scrub. Narrow zone (3px each side) so it only fires
+        // when the user actually grabs the white line, not on a clip body.
+        let playhead_hit = egui::Rect::from_min_max(
+            egui::pos2(play_x - 3.0, bar_rect.top()),
+            egui::pos2(play_x + 3.0, bar_rect.bottom()),
+        );
+        let playhead_resp = ui.allocate_rect(playhead_hit, egui::Sense::drag());
+        if playhead_resp.dragged() {
+            let dx = playhead_resp.drag_delta().x;
+            let dt = (dx / bar_rect.width() as f32) as f64 * dur;
+            let new_t = (self.playhead + dt).clamp(0.0, dur);
+            self.playhead = new_t;
+            self.request_frame(new_t);
+        }
 
-        // Edge time labels (HH:MM:SS)
+        // Playhead line — visual only. No interactive hit rect here because
+        // it would intercept clicks on clips underneath. Seek by clicking on
+        // the strip's empty area instead (handled by bar_resp.clicked).
+
+        // Edge + tick labels in full HH:MM:SS detail.
         let label_fmt = |t: f64| -> String {
-            let total = t as u64;
+            let total = t.max(0.0) as u64;
             let h = total / 3600;
             let m = (total % 3600) / 60;
             let s = total % 60;
@@ -417,59 +695,39 @@ impl ClipperApp {
             egui::Color32::from_gray(180),
         );
 
-        // Click-to-seek-and-play on bar background: clicking anywhere in
-        // [IN, OUT] starts playback from the clicked time and plays to OUT.
-        // Clicks outside that range fall back to seeking only (no play).
-        if bar_resp.clicked() || bar_resp.dragged() {
-            if let Some(pos) = bar_resp.interact_pointer_pos() {
-                let frac = ((pos.x - bar_rect.left()) / bar_rect.width()).clamp(0.0, 1.0) as f64;
-                let raw_t = frac * dur;
-                let snapped_t = if fps > 0.0 { (raw_t * fps).round() / fps } else { raw_t };
-                let clamped_t = snapped_t.clamp(self.in_marker, self.out_marker);
-                self.playhead = clamped_t;
-                self.request_frame(clamped_t);
-
-                // Auto-play: from click (clamped to [IN, OUT]) to OUT.
-                if self.out_marker > self.in_marker && clamped_t < self.out_marker {
-                    self.spawn_play(meta.path, meta.width, meta.height, fps, clamped_t, self.out_marker);
-                }
-            }
-        }
-
-        // IN triangle drag
-        let in_tri_rect = egui::Rect::from_center_size(
-            in_pos,
-            egui::vec2(tri_size * 2.5, tri_size * 2.5),
-        );
-        let in_tri_resp = ui.allocate_rect(in_tri_rect, egui::Sense::drag());
-        if in_tri_resp.dragged() {
-            let delta_x = in_tri_resp.drag_delta().x;
-            let delta_t = (delta_x / bar_rect.width() as f32) as f64 * dur;
-            let raw = self.in_marker + delta_t;
-            let snapped = if fps > 0.0 { (raw * fps).round() / fps } else { raw };
-            let new_in = snapped.clamp(0.0, self.out_marker);
-            if (new_in - self.in_marker).abs() > 1e-6 {
-                self.in_marker = new_in;
-                self.playing = false;
-            }
-        }
-
-        // OUT triangle drag
-        let out_tri_rect = egui::Rect::from_center_size(
-            out_pos,
-            egui::vec2(tri_size * 2.5, tri_size * 2.5),
-        );
-        let out_tri_resp = ui.allocate_rect(out_tri_rect, egui::Sense::drag());
-        if out_tri_resp.dragged() {
-            let delta_x = out_tri_resp.drag_delta().x;
-            let delta_t = (delta_x / bar_rect.width() as f32) as f64 * dur;
-            let raw = self.out_marker + delta_t;
-            let snapped = if fps > 0.0 { (raw * fps).round() / fps } else { raw };
-            let new_out = snapped.clamp(self.in_marker, dur);
-            if (new_out - self.out_marker).abs() > 1e-6 {
-                self.out_marker = new_out;
-                self.playing = false;
-            }
+        // Tick marks at adaptive intervals based on duration. Aim for
+        // roughly 6–12 ticks across the strip so labels stay readable.
+        let tick_secs = if dur < 30.0 {
+            2.0
+        } else if dur < 120.0 {
+            10.0
+        } else if dur < 600.0 {
+            30.0
+        } else if dur < 1800.0 {
+            60.0
+        } else if dur < 3600.0 {
+            300.0
+        } else {
+            600.0
+        };
+        let mut t = tick_secs;
+        while t < dur - 0.001 {
+            let tx = to_x(t);
+            ui.painter().line_segment(
+                [
+                    egui::pos2(tx, bar_rect.bottom() - 5.0),
+                    egui::pos2(tx, bar_rect.bottom()),
+                ],
+                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(140)),
+            );
+            ui.painter().text(
+                egui::pos2(tx, bar_rect.bottom() - 7.0),
+                egui::Align2::CENTER_BOTTOM,
+                label_fmt(t),
+                egui::FontId::monospace(9.0),
+                egui::Color32::from_gray(160),
+            );
+            t += tick_secs;
         }
     }
 }
@@ -495,17 +753,31 @@ impl eframe::App for ClipperApp {
                 if ui.button(play_label).clicked() { self.toggle_play(); }
                 if let Some(meta) = &self.source {
                     ui.label(format!("{:.2}s / {:.2}s", self.playhead, meta.duration_secs));
-                    if ui.button("Set IN").clicked() { self.in_marker = self.playhead; }
-                    if ui.button("Set OUT").clicked() { self.out_marker = self.playhead; }
-                    ui.label(format!("IN {:.2}  OUT {:.2}", self.in_marker, self.out_marker));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let batch_running = self.export_queue.is_some();
                     if self.export.in_progress {
+                        if batch_running {
+                            let total = self.last_export_count.max(1);
+                            let cur = self.export_index.saturating_sub(1).min(total);
+                            ui.label(format!("Exporting clip {} / {}", cur, total));
+                        }
                         ui.add(egui::ProgressBar::new(self.export.progress).show_percentage());
                         if ui.button("Cancel").clicked() { self.cancel_export(); }
+                    } else if batch_running {
+                        let total = self.last_export_count.max(1);
+                        ui.label(format!("Exporting clip {} / {}", self.export_index, total));
                     } else {
-                        let label = if self.last_export.is_some() { "Export next" } else { "Export" };
-                        if ui.button(label).clicked() { self.start_export(); }
+                        let export_all_enabled = !self.clips.is_empty() && !batch_running;
+                        if ui
+                            .add_enabled(
+                                export_all_enabled,
+                                egui::Button::new(format!("Export all ({})", self.clips.len())),
+                            )
+                            .clicked()
+                        {
+                            self.start_batch();
+                        }
                     }
                 });
             });
@@ -545,8 +817,9 @@ impl eframe::App for ClipperApp {
                         egui::Color32::WHITE,
                     );
 
-                    // crop overlay
-                    if let Some(crop) = &self.crop {
+                    // crop overlay (uses the currently-selected crop)
+                    let crop = self.current_crop;
+                    {
                         let crop_screen = egui::Rect::from_min_size(
                             display_rect.min
                                 + egui::vec2(crop.x as f32 * src_to_disp, crop.y as f32 * src_to_disp),
@@ -581,8 +854,10 @@ impl eframe::App for ClipperApp {
                         }
                     }
 
-                    // drag crop
-                    if let Some(crop) = self.crop.clone() {
+                    // drag crop — only updates the SELECTED clip's crop.
+                    // Drag is ignored if no clip is selected; user must
+                    // click a clip first to "own" the crop edits.
+                    {
                         let crop_screen = egui::Rect::from_min_size(
                             display_rect.min
                                 + egui::vec2(crop.x as f32 * src_to_disp, crop.y as f32 * src_to_disp),
@@ -590,12 +865,16 @@ impl eframe::App for ClipperApp {
                         );
                         let crop_resp = ui.allocate_rect(crop_screen, egui::Sense::drag());
                         if crop_resp.dragged() {
-                            let delta = crop_resp.drag_delta();
-                            if let Some(c) = &mut self.crop {
-                                c.x += disp_to_src(delta.x);
-                                c.y += disp_to_src(delta.y);
-                                c.clamp_to(meta.width, meta.height);
+                            if let Some(sel) = self.selected_clip {
+                                let delta = crop_resp.drag_delta();
+                                self.current_crop.x += disp_to_src(delta.x);
+                                self.current_crop.y += disp_to_src(delta.y);
+                                self.current_crop.clamp_to(meta.width, meta.height);
+                                if let Some(c) = self.clips.get_mut(sel) {
+                                    c.crop = self.current_crop;
+                                }
                             }
+                            // No clip selected → ignore the drag.
                         }
                     }
                 } else {
